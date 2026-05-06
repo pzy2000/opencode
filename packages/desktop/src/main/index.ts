@@ -4,12 +4,10 @@ import { existsSync, mkdirSync, rmSync } from "node:fs"
 import * as http from "node:http"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
-import { getCACertificates, setDefaultCACertificates } from "node:tls"
+import * as tls from "node:tls"
 import type { Event } from "electron"
 import { app, BrowserWindow, dialog } from "electron"
 import pkg from "electron-updater"
-import { drizzle } from "drizzle-orm/node-sqlite/driver"
-import type { Server } from "virtual:opencode-server"
 
 import contextMenu from "electron-context-menu"
 contextMenu({ showSaveImageAs: true, showLookUpSelection: false, showSearchWithGoogle: false })
@@ -42,13 +40,24 @@ const logger = initLogging()
 const { autoUpdater } = pkg
 
 import type { InitStep, ServerReadyData, SqliteMigrationProgress } from "../preload/types"
+type NodeTlsWithSystemCertificates = typeof tls & {
+  getCACertificates: (type: "default" | "system") => string[]
+  setDefaultCACertificates: (certificates: string[]) => void
+}
 import { checkAppExists, resolveAppPath, wslPath } from "./apps"
 import { CHANNEL, UPDATER_ENABLED } from "./constants"
 import { registerIpcHandlers, sendDeepLinks, sendMenuCommand, sendSqliteMigrationProgress } from "./ipc"
 import { initLogging } from "./logging"
 import { parseMarkdown } from "./markdown"
 import { createMenu } from "./menu"
-import { allocatePort, getDefaultServerUrl, setDefaultServerUrl, spawnLocalServer, spawnWslSidecar } from "./server"
+import {
+  allocatePort,
+  getDefaultServerUrl,
+  setDefaultServerUrl,
+  spawnLocalServer,
+  spawnWslSidecar,
+  type SidecarListener,
+} from "./server"
 import { createWslServersController } from "./wsl-servers"
 import {
   createLoadingWindow,
@@ -63,7 +72,7 @@ const initEmitter = new EventEmitter()
 let initStep: InitStep = { phase: "server_waiting" }
 
 let mainWindow: BrowserWindow | null = null
-let server: Server.Listener | null = null
+let server: SidecarListener | null = null
 const loadingComplete = defer<void>()
 
 const pendingDeepLinks: string[] = []
@@ -136,20 +145,19 @@ function setupApp() {
   })
 
   app.on("before-quit", () => {
-    killSidecar()
+    void killSidecar()
     wslServers.stopAll()
   })
 
   app.on("will-quit", () => {
-    killSidecar()
+    void killSidecar()
     wslServers.stopAll()
   })
 
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.on(signal, () => {
-      killSidecar()
+      void killSidecar().finally(() => app.exit(0))
       wslServers.stopAll()
-      app.exit(0)
     })
   }
 
@@ -165,7 +173,10 @@ function setupApp() {
 
 function useSystemCertificates() {
   try {
-    setDefaultCACertificates([...new Set([...getCACertificates("default"), ...getCACertificates("system")])])
+    const nodeTls = tls as NodeTlsWithSystemCertificates
+    nodeTls.setDefaultCACertificates([
+      ...new Set([...nodeTls.getCACertificates("default"), ...nodeTls.getCACertificates("system")]),
+    ])
   } catch (error) {
     logger.warn("failed to load system certificates", error)
   }
@@ -216,22 +227,24 @@ async function initialize() {
       if (mainWindow) sendSqliteMigrationProgress(mainWindow, progress)
     })
 
-    if (needsMigration) {
-      const { Database, JsonMigration } = await import("virtual:opencode-server")
-      await JsonMigration.run(drizzle({ client: Database.Client().$client }), {
-        progress: (event: { current: number; total: number }) => {
-          const percent = Math.round((event.current / event.total) * 100)
-          initEmitter.emit("sqlite", { type: "InProgress", value: percent })
-        },
-      })
-      initEmitter.emit("sqlite", { type: "Done" })
-    }
-
     logger.log("spawning sidecar", { url })
-    const { listener, health } = await spawnLocalServer(hostname, port, password, () => {
-      ensureLoopbackNoProxy()
-      useEnvProxy()
-    })
+    const { listener, health } = await spawnLocalServer(
+      hostname,
+      port,
+      password,
+      () => {
+        ensureLoopbackNoProxy()
+        useEnvProxy()
+      },
+      {
+        needsMigration,
+        userDataPath: app.getPath("userData"),
+        onSqliteProgress: (progress) => initEmitter.emit("sqlite", progress),
+        onStdout: (message) => logger.log("sidecar stdout", { message }),
+        onStderr: (message) => logger.warn("sidecar stderr", { message }),
+        onExit: (code) => logger.warn("sidecar exited", { code }),
+      },
+    )
     server = listener
     serverReady.resolve({
       url,
@@ -333,19 +346,21 @@ registerIpcHandlers({
   setBackgroundColor: (color) => setBackgroundColor(color),
 })
 
-function killSidecar() {
+async function killSidecar() {
   if (!server) return
-  server.stop()
+  const current = server
   server = null
+  await current.stop()
 }
 
 function relaunchApp() {
   // app.exit() skips before-quit / will-quit, so relaunch callers must
   // explicitly stop sidecars here rather than relying on process hooks.
-  killSidecar()
   wslServers.stopAll()
-  app.relaunch()
-  app.exit(0)
+  void killSidecar().finally(() => {
+    app.relaunch()
+    app.exit(0)
+  })
 }
 
 function ensureLoopbackNoProxy() {
@@ -445,7 +460,7 @@ async function installUpdate() {
   logger.log("installing downloaded update", {
     version: downloadedUpdateVersion,
   })
-  killSidecar()
+  await killSidecar()
   wslServers.stopAll()
   autoUpdater.quitAndInstall()
 }
